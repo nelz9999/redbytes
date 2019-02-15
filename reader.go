@@ -253,7 +253,7 @@ func newStreamFromHashReader(doer Doer, key string, ahead int) io.Reader {
 			if final != -1 && count > final {
 				return 0, io.EOF
 			}
-			return 0, ErrIncomplete
+			return 0, errIncomplete
 		}
 		return offset, nil
 	})
@@ -270,7 +270,7 @@ func newRetryReader(ctx context.Context, base io.Reader, starve time.Duration, t
 			case <-ctx.Done():
 				return 0, ctx.Err()
 			case <-time.After(starveTTL):
-				return 0, ErrIncomplete
+				return 0, io.ErrUnexpectedEOF
 			case <-first:
 				// we automatically want to try the underlying Reader
 				// on our first time through
@@ -290,7 +290,7 @@ func newRetryReader(ctx context.Context, base io.Reader, starve time.Duration, t
 				// n > 0 bytes returned before considering the error err."
 				recent = time.Now()
 			}
-			if err != ErrIncomplete {
+			if err != errIncomplete {
 				// We only want to loop/retry when we've gotten
 				// the ErrIncomplete signal from the underlying Reader
 				return n, err
@@ -310,7 +310,7 @@ func fetchInfo(ctx context.Context, doer Doer, key string, starve time.Duration,
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(starveTTL):
-			return nil, ErrIncomplete
+			return nil, io.ErrUnexpectedEOF
 		case <-first:
 			// we automatically want to try the underlying Reader
 			// on our first time through

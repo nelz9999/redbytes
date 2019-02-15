@@ -29,10 +29,10 @@ const (
 	// that collides with existing data in Redis
 	ErrKeyExists = ErrorString("redbytes: key already exists")
 
-	// ErrIncomplete is returned to signify that we have returned
+	// errIncomplete is returned to signify that we have returned
 	// as much data as is available, but the write-side has not yet
 	// indicated that the stream is finished.
-	ErrIncomplete = ErrorString("redbytes: stream is incomplete")
+	errIncomplete = ErrorString("redbytes: stream is incomplete")
 
 	// ErrNoStimulus is returned from NewRedisByteStreamReader when
 	// neither PollInterval(...) nor Subscribe(...) were configured.
