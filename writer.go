@@ -1,6 +1,7 @@
 package redbytes
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -99,7 +100,7 @@ func PublishClient(client Doer) WriteOption {
 // should be safe to re-use the client afterwards, as well as concurrently
 // (as long as no other operations are blocking on the client, like for
 // a Subscribe/PSubscribe).
-func NewRedisByteStreamWriter(client Doer, key string, opts ...WriteOption) (io.WriteCloser, error) {
+func NewRedisByteStreamWriter(ctx context.Context, client Doer, key string, opts ...WriteOption) (io.WriteCloser, error) {
 	var err error
 
 	wo := &WriteOptions{
@@ -124,12 +125,12 @@ func NewRedisByteStreamWriter(client Doer, key string, opts ...WriteOption) (io.
 		return nil, err
 	}
 
-	wc := newStreamToHashWriteCloser(client, key, wo.maxChunk)
+	wc := newStreamToHashWriteCloser(ctx, client, key, wo.maxChunk)
 	if wo.expires > 0 {
 		wc = newExpiresWriteCloser(wc, client, key, wo.expires)
 	}
 	if wo.pubChan != "" {
-		wc = newPublishesWriteCloser(wc, wo.pubDoer, wo.pubChan)
+		wc = newPublishesWriteCloser(wc, wo.pubDoer, wo.pubChan, key)
 	}
 
 	return wc, nil
@@ -202,10 +203,14 @@ func (cwc closureWriteCloser) Close() error {
 	return cwc.cfunc()
 }
 
-func newStreamToHashWriteCloser(doer Doer, key string, chunkMax int) io.WriteCloser {
+func newStreamToHashWriteCloser(ctx context.Context, doer Doer, key string, chunkMax int) io.WriteCloser {
 	chunkNum := 0
 	return closureWriteCloser{
 		wfunc: func(p []byte) (int, error) {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+
 			size := len(p)
 			if size == 0 {
 				return 0, nil
@@ -257,14 +262,16 @@ func newExpiresWriteCloser(base io.WriteCloser, doer Doer, key string, seconds i
 	}
 }
 
-func newPublishesWriteCloser(base io.WriteCloser, doer Doer, channel string) io.WriteCloser {
+// newPublishesWriteCloser publish the key onto the given channel. This means
+// the caller could be listening on a single channel for multiple streams.
+func newPublishesWriteCloser(base io.WriteCloser, doer Doer, channel, key string) io.WriteCloser {
 	return closureWriteCloser{
 		wfunc: func(p []byte) (int, error) {
 			n, err := base.Write(p)
 			if err != nil || n == 0 {
 				return n, err
 			}
-			_, err = doer.Do("PUBLISH", channel, "")
+			_, err = doer.Do("PUBLISH", channel, key)
 			return n, err
 		},
 		cfunc: func() error {
@@ -272,7 +279,7 @@ func newPublishesWriteCloser(base io.WriteCloser, doer Doer, channel string) io.
 			if err != nil {
 				return err
 			}
-			_, err = doer.Do("PUBLISH", channel, "")
+			_, err = doer.Do("PUBLISH", channel, key)
 			return err
 		},
 	}
@@ -293,17 +300,16 @@ func newClosedPipeWriteCloser(base io.WriteCloser) io.WriteCloser {
 			return n, err
 		},
 		cfunc: func() error {
-			// TODO: decide - in the case of a Write(...) error, do we want to
-			// completely kill a trailing Close(), or only allow through
-			// a single one? (
+			// In the case of a Write(...) error, we still want to
+			// allow through a close. The thinking goes this way:
 			// - Not even attempting to close the data stream
-			// 		would likely lead to starvations on read side.
+			// 		might lead to starvations on read side.
 			// - If it's a long-lasting connection error, we'd be
-			// 		busted up either way
+			// 		messed up either way
 			// - If it's an intermittent connection error, then closing
 			// 		out the data would be a nice signal to the read side that
-			// 		the stream has ended, and we've still protected ourselves
-			// 		from writing data out-of-order in the Write(...)
+			// 		the stream has ended, yet we've still protected ourselves
+			// 		from writing data out-of-order.
 			if closed {
 				return nil
 			}
