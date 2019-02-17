@@ -90,6 +90,16 @@ func Subscribe(client redis.Conn, channel string) ReadOption {
 	}
 }
 
+// NewRedisByteStreamReader is a blocking call that waits for positive sign
+// that a stream with the given key exists, or times out waiting for such.
+// On success, it returns any metadata information that the write-side
+// defined, and an io.ReadCloser. Individual Read(...) calls also block
+// while waiting for new information provided by the write-side, or until
+// a timeout. If a timeout occurs waiting for the end of the stream,
+// the Read(...) returns io.ErrUnexpectedEOF.
+// Retries looking for updated stream data require some kind of stimulus,
+// therefore at least one of Subscribe(...) or PollInterval(...) must be
+// defined.
 func NewRedisByteStreamReader(parent context.Context, doer Doer, key string, opts ...ReadOption) ([]byte, io.ReadCloser, error) {
 	ro := &ReadOptions{
 		starve: DefaultStarveInterval,
@@ -209,6 +219,10 @@ func newStreamFromHashReader(doer Doer, key string, ahead int) io.Reader {
 			fields = append(fields, chunkEnd)
 		}
 		for ix := count; ix <= count+ahead; ix++ {
+			if final != -1 && ix > final {
+				// don't over-ask if we know the end
+				break
+			}
 			fields = append(fields, fmt.Sprintf(chunkFmt, ix))
 		}
 
@@ -233,6 +247,9 @@ func newStreamFromHashReader(doer Doer, key string, ahead int) io.Reader {
 		offset := 0
 		for ix, data := range results {
 			if len(data) == 0 {
+				// FYI, Write shouldn't store 0-length chunks, but if anyone
+				// mucks with the data and injects a 0-length chunk, we
+				// will get stuck on this until timeout.
 				break
 			}
 			n := copy(p[offset:], data)
@@ -260,10 +277,15 @@ func newStreamFromHashReader(doer Doer, key string, ahead int) io.Reader {
 }
 
 func newRetryReader(ctx context.Context, base io.Reader, starve time.Duration, tick <-chan time.Time, subs <-chan struct{}) io.Reader {
-	first := make(chan struct{})
-	close(first)
+	first := make(chan struct{}, 1)
 	recent := time.Now()
 	return readerFunc(func(p []byte) (int, error) {
+		select {
+		case first <- struct{}{}:
+			// happy path
+		default:
+			// no stall if first didn't get drained on a previous iteration
+		}
 		for {
 			starveTTL := recent.Add(starve).Sub(time.Now())
 			select {
@@ -274,7 +296,6 @@ func newRetryReader(ctx context.Context, base io.Reader, starve time.Duration, t
 			case <-first:
 				// we automatically want to try the underlying Reader
 				// on our first time through
-				first = nil
 			case <-tick:
 				// We received polling stimulus to try the read again
 			case <-subs:
@@ -321,7 +342,7 @@ func fetchInfo(ctx context.Context, doer Doer, key string, starve time.Duration,
 			// We received pubsub stimulus to try the read again
 		}
 
-		ok, err := redis.Bool(doer.Do("HEXISTS", key))
+		ok, err := redis.Bool(doer.Do("HEXISTS", key, metadata))
 		if err != nil {
 			return nil, err
 		}

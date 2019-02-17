@@ -12,7 +12,7 @@ import (
 	"github.com/gomodule/redigo/redis"
 )
 
-func TestIntegrationWriter(t *testing.T) {
+func TestIntegrationWriterDirect(t *testing.T) {
 	testCases := []struct {
 		name  string
 		src   io.Reader
@@ -56,9 +56,8 @@ func TestIntegrationWriter(t *testing.T) {
 	durTTL := time.Second * time.Duration(setTTL)
 	maxPTTL := setTTL * 1000
 
-	fm := fetchers(t)
 	base := randomString()
-	for client, fetcher := range fm {
+	for client, fetcher := range fetchers(t) {
 		t.Run(client, func(t *testing.T) {
 			for ix, tc := range testCases {
 				t.Run(tc.name, func(t *testing.T) {
@@ -115,9 +114,9 @@ func TestIntegrationWriter(t *testing.T) {
 						}
 					}
 					if hasErr {
-						contents, err := redis.StringMap(conn.Do("HGETALL", name))
-						if err != nil {
-							t.Fatalf("unexpected: %v\n", err)
+						contents, cerr := redis.StringMap(conn.Do("HGETALL", name))
+						if cerr != nil {
+							t.Fatalf("unexpected: %v\n", cerr)
 						}
 						t.Logf("full contents of %q:\n", name)
 						for k, v := range contents {
