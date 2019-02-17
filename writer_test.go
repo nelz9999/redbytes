@@ -16,26 +16,31 @@ func TestIntegrationWriter(t *testing.T) {
 	testCases := []struct {
 		name  string
 		src   io.Reader
+		max   int
 		parts []string
 	}{
 		{
 			"remainder",
-			chunkReader(bytes.NewBufferString(alphabet), 10),
+			bytes.NewBufferString(alphabet),
+			10,
 			[]string{"abcdefghij", "klmnopqrst", "uvwxyz"},
 		},
 		{
 			"exact multiple",
-			chunkReader(bytes.NewBuffer([]byte(alphabet)[1:]), 5),
+			bytes.NewBuffer([]byte(alphabet)[1:]),
+			5,
 			[]string{"bcdef", "ghijk", "lmnop", "qrstu", "vwxyz"},
 		},
 		{
 			"zero length",
 			bytes.NewBufferString(""),
+			DefaultMaxChunkSize,
 			nil,
 		},
 		{
 			"single bytes",
 			chunkReader(bytes.NewBufferString(alphabet), 1),
+			DefaultMaxChunkSize,
 			[]string{
 				"a", "b", "c", "d", "e",
 				"f", "g", "h", "i", "j",
@@ -71,6 +76,7 @@ func TestIntegrationWriter(t *testing.T) {
 						name,
 						Expires(durTTL),
 						Metadata([]byte(meta)),
+						MaxChunkSize(tc.max),
 					)
 					if err != nil {
 						t.Fatalf("unexpected: %v\n", err)
@@ -100,7 +106,8 @@ func TestIntegrationWriter(t *testing.T) {
 					for field, should := range expectations {
 						val, err = redis.String(conn.Do("HGET", name, field))
 						if err != nil {
-							t.Fatalf("unexpected: %v\n", err)
+							hasErr = true
+							t.Errorf("unexpected: %v\n", err)
 						}
 						if val != should {
 							hasErr = true

@@ -13,3 +13,6 @@ bash:
 
 cli:
 	docker-compose exec redis-cluster /redis/src/redis-cli -p $(CLI_PORT)
+
+monitor:
+	docker-compose exec redis-cluster /redis/src/redis-cli -p $(CLI_PORT) monitor
