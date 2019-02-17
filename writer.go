@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/gomodule/redigo/redis"
 )
@@ -12,7 +13,6 @@ import (
 // NewRedisByteStreamWriter
 type WriteOptions struct {
 	info     []byte
-	noClean  bool
 	maxChunk int
 	expires  int
 	pubChan  string
@@ -33,20 +33,11 @@ func Metadata(info []byte) WriteOption {
 	}
 }
 
-// DisableCollisionCleanup stops us from removing a field that may have
-// been added to a hash that already exists at the key given to us
-// by the caller. You probably don't want to use this, but it is provided
-// for completeness.
-func DisableCollisionCleanup() WriteOption {
-	return func(wo *WriteOptions) error {
-		wo.noClean = true
-		return nil
-	}
-}
-
 // MaxChunkSize sets the upper bound of how "wide" a single chunck can be
-// when written to Redis as a hash field. If not set, the value used
-// is DefaultMaxChunkSize.
+// when written to Redis as a hash field. This has implications on the
+// read-side - if the read buffers are smaller than what is stored
+// in a single field, they may receive an io.ErrShortBuffer.
+// If not set, the value used is DefaultMaxChunkSize.
 func MaxChunkSize(max int) WriteOption {
 	return func(wo *WriteOptions) error {
 		if max <= 0 {
@@ -58,12 +49,13 @@ func MaxChunkSize(max int) WriteOption {
 }
 
 // Expires sets the given stream of data to expire out of Redis after the
-// given amount of time. If not set, the stream will be written without
-// an expiry time.
-func Expires(seconds int) WriteOption {
+// given amount of time (rounded to the nearest second).
+// If not set, the stream will be written without an expiry time.
+func Expires(d time.Duration) WriteOption {
 	return func(wo *WriteOptions) error {
-		if seconds < 0 {
-			return fmt.Errorf("expiry seconds must be >=0: %d", seconds)
+		seconds := int(d.Round(time.Second).Seconds())
+		if seconds <= 0 {
+			return fmt.Errorf("expiry seconds must be >0: %d", seconds)
 		}
 		wo.expires = seconds
 		return nil
@@ -87,6 +79,9 @@ func PublishChannel(channel string) WriteOption {
 // by default.
 func PublishClient(client Doer) WriteOption {
 	return func(wo *WriteOptions) error {
+		if client == nil {
+			return fmt.Errorf("publish client must not be nil")
+		}
 		wo.pubDoer = client
 		return nil
 	}
@@ -95,19 +90,20 @@ func PublishClient(client Doer) WriteOption {
 // NewRedisByteStreamWriter returns an io.WriteCloser that stores the written
 // byte stream as a hash in Redis at the given key. This allows a receiver
 // on the other end to get access to the data before the whole stream
-// is finished being written, even if the write-side takes a long to finish.
-// The given client is not closed upon call to the Close() method, so it
+// is finished being written, even if the write-side takes a while to finish.
+// The Redis client is not closed upon call to the Close() method, so it
 // should be safe to re-use the client afterwards, as well as concurrently
 // (as long as no other operations are blocking on the client, like for
 // a Subscribe/PSubscribe).
 func NewRedisByteStreamWriter(ctx context.Context, client Doer, key string, opts ...WriteOption) (io.WriteCloser, error) {
-	var err error
-
+	// Default values
 	wo := &WriteOptions{
 		maxChunk: DefaultMaxChunkSize,
 		pubDoer:  client,
 	}
 
+	// Set conditional configuration
+	var err error
 	for _, opt := range opts {
 		err = opt(wo)
 		if err != nil {
@@ -115,79 +111,52 @@ func NewRedisByteStreamWriter(ctx context.Context, client Doer, key string, opts
 		}
 	}
 
-	res := newBaseReserver()
-	if !wo.noClean {
-		res = newCleanupReserver(res)
-	}
-
-	_, err = res.Reserve(client, key, wo.info)
+	// Jealously reserve our space in the datastore
+	err = reserve(client, key, wo.info)
 	if err != nil {
 		return nil, err
 	}
 
+	// Basic writer
 	wc := newStreamToHashWriteCloser(ctx, client, key, wo.maxChunk)
+
+	// Add the expires writer if configured
 	if wo.expires > 0 {
 		wc = newExpiresWriteCloser(wc, client, key, wo.expires)
 	}
+
+	// Add the pubsub publisher if configured
 	if wo.pubChan != "" {
 		wc = newPublishesWriteCloser(wc, wo.pubDoer, wo.pubChan, key)
 	}
 
+	// Send it off into the world to do its work
 	return wc, nil
 }
 
-// reserver is a composable interface for claiming the key/hash
-type reserver interface {
-	Reserve(doer Doer, key string, info []byte) (int, error)
-}
+func reserve(doer Doer, key string, info []byte) error {
+	size, err := redis.Int(doer.Do("HLEN", key))
+	if err != nil {
+		// This case catches connection issues, as well as if
+		// the key exists, but is of a different type than a hash.
+		return err
+	}
+	if size != 0 {
+		// This catches the case where the hash already exists
+		return ErrKeyExists
+	}
 
-// reserverFunc is an adapter a function to conform to the reserver interface
-type reserverFunc func(doer Doer, key string, info []byte) (int, error)
-
-func (fn reserverFunc) Reserve(doer Doer, key string, info []byte) (int, error) {
-	return fn(doer, key, info)
-}
-
-func newBaseReserver() reserver {
-	return reserverFunc(func(doer Doer, key string, info []byte) (int, error) {
-		// Plant our flag that we want to own this key and hash field
-		ok, err := redis.Bool(doer.Do("HSETNX", key, metadata, info))
-		if err != nil {
-			// This case catches connection issues, as well as a key that
-			// already exists but is of a different type than a hash.
-			return 0, err
-		}
-		if !ok {
-			// This is the case where we are racing against another
-			// writer, and we have lost the race.
-			return 0, ErrKeyExists
-		}
-
-		// Now, there is one last possibility to consider. We may have been
-		// the first to write the key/field combo, but that doesn't protect
-		// against us having written into some arbitrary other hash with
-		// the same key, but different fields. If this happened, there will
-		// be more than the one field.
-		return redis.Int(doer.Do("HLEN", key))
-	})
-}
-
-func newCleanupReserver(base reserver) reserver {
-	return reserverFunc(func(doer Doer, key string, info []byte) (int, error) {
-		count, err := base.Reserve(doer, key, info)
-		if err != nil || count == 1 {
-			return count, err
-		}
-
-		// If the caller gave us a bum steer, and we've now dropped
-		// a new field into an existing hash, let's clean up our
-		// mess before we bail out.
-		_, err = doer.Do("HDEL", key, metadata)
-		if err != nil {
-			return count, err
-		}
-		return count, ErrKeyExists
-	})
+	// Plant our flag that we want to own this key and hash field
+	ok, err := redis.Bool(doer.Do("HSETNX", key, metadata, info))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// This is the case where we are racing against another
+		// redbytes writer, and we have lost the race.
+		return ErrKeyExists
+	}
+	return nil
 }
 
 type closureWriteCloser struct {
@@ -303,7 +272,7 @@ func newClosedPipeWriteCloser(base io.WriteCloser) io.WriteCloser {
 			// In the case of a Write(...) error, we still want to
 			// allow through a close. The thinking goes this way:
 			// - Not even attempting to close the data stream
-			// 		might lead to starvations on read side.
+			// 		would lead to starvations on read side.
 			// - If it's a long-lasting connection error, we'd be
 			// 		messed up either way
 			// - If it's an intermittent connection error, then closing

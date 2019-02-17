@@ -1,11 +1,13 @@
 package redbytes
 
-import "time"
+import (
+	"time"
+)
 
 const (
-	chunkFmt = "chunk:%d"
-	chunkEnd = "chunk:end"
-	metadata = "metadata"
+	chunkFmt = "c:%d"
+	chunkEnd = "c:end"
+	metadata = "c:md"
 
 	// DefaultMaxChunkSize is the base defined width of each data field
 	DefaultMaxChunkSize = 1024
