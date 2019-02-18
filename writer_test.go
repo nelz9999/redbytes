@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,37 +19,40 @@ func TestIntegrationWriterDirect(t *testing.T) {
 		src   io.Reader
 		max   int
 		parts []string
+		pubX  int
 	}{
 		{
 			"remainder",
 			bytes.NewBufferString(alphabet),
 			10,
 			[]string{"abcdefghij", "klmnopqrst", "uvwxyz"},
+			2, // 3 chunk in one go, plus close
 		},
 		{
 			"exact multiple",
 			bytes.NewBuffer([]byte(alphabet)[1:]),
 			5,
 			[]string{"bcdef", "ghijk", "lmnop", "qrstu", "vwxyz"},
+			2, // 5 chunk in one go, plus close
 		},
 		{
 			"zero length",
 			bytes.NewBufferString(""),
 			DefaultMaxChunkSize,
 			nil,
+			1, // just close
 		},
 		{
 			"single bytes",
 			chunkReader(bytes.NewBufferString(alphabet), 1),
 			DefaultMaxChunkSize,
 			[]string{
-				"a", "b", "c", "d", "e",
-				"f", "g", "h", "i", "j",
-				"k", "l", "m", "n", "o",
-				"p", "q", "r", "s", "t",
-				"u", "v", "w", "x", "y",
-				"z",
+				"a", "b", "c", "d", "e", "f", "g", "h",
+				"i", "j", "k", "l", "m", "n", "o", "p",
+				"q", "r", "s", "t", "u", "v", "w", "x",
+				"y", "z",
 			},
+			27, // individual chunks, plus close
 		},
 	}
 
@@ -68,6 +72,14 @@ func TestIntegrationWriterDirect(t *testing.T) {
 					conn := fetcher.fetch()
 					defer conn.Close()
 
+					pubN := 0
+					pub := doerFunc(func(cmd string, args ...interface{}) (interface{}, error) {
+						if cmd == "PUBLISH" && args[0] == meta && args[1] == name {
+							pubN++
+						}
+						return "0", nil
+					})
+
 					// function under test
 					wc, err := NewRedisByteStreamWriter(
 						context.Background(),
@@ -76,6 +88,8 @@ func TestIntegrationWriterDirect(t *testing.T) {
 						Expires(durTTL),
 						Metadata([]byte(meta)),
 						MaxChunkSize(tc.max),
+						PublishChannel(meta),
+						PublishClient(pub),
 					)
 					if err != nil {
 						t.Fatalf("unexpected: %v\n", err)
@@ -131,6 +145,16 @@ func TestIntegrationWriterDirect(t *testing.T) {
 					if pttl >= maxPTTL {
 						t.Errorf("expected PTTL < %d; got %d\n", maxPTTL, pttl)
 					}
+
+					if pubN != tc.pubX {
+						t.Errorf("expected %d PUBLISH commands; got %d\n", tc.pubX, pubN)
+					}
+
+					// EOL state expectations
+					_, err = wc.Write([]byte("postfacto"))
+					if err != io.ErrClosedPipe {
+						t.Errorf("expected %q; got %v\n", io.ErrClosedPipe, err)
+					}
 				})
 			}
 		})
@@ -150,16 +174,9 @@ func TestIntegrationWriteReserveErrors(t *testing.T) {
 			},
 		},
 		{
-			"non-redbytes hash",
+			"collision hash",
 			func(conn redis.Conn, name string) error {
 				_, err := conn.Do("HSET", name, "bubba", "gump")
-				return err
-			},
-		},
-		{
-			"lost lock race",
-			func(conn redis.Conn, name string) error {
-				_, err := conn.Do("HSET", name, metadata, "gump")
 				return err
 			},
 		},
@@ -183,11 +200,82 @@ func TestIntegrationWriteReserveErrors(t *testing.T) {
 						t.Errorf("unexpected: %v\n", err)
 					}
 
-					err = reserve(conn, name, nil)
+					wc, err := NewRedisByteStreamWriter(context.Background(), conn, name)
 					if err == nil {
 						t.Errorf("expected an error on NewRedisByteStreamReader")
+						wc.Close()
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestWriteReserveErrors(t *testing.T) {
+	// Though similar to the Integration test version, it's easier
+	// to simulate the race-condition error via a fake Doer
+	key := randomString()
+	info := randomString()
+
+	testCases := []struct {
+		name string
+		doer Doer
+		err  string
+	}{
+		{
+			"data type conflict",
+			doerFunc(func(cmd string, args ...interface{}) (interface{}, error) {
+				if cmd == "HLEN" && args[0] == key {
+					return nil, fmt.Errorf("conflict")
+				}
+				panic("should not get here")
+			}),
+			"conflict",
+		},
+		{
+			"hash collision",
+			doerFunc(func(cmd string, args ...interface{}) (interface{}, error) {
+				if cmd == "HLEN" && args[0] == key {
+					return []byte("1"), nil
+				}
+				panic("should not get here")
+			}),
+			ErrKeyExists.Error(),
+		},
+		{
+			"flaky connection",
+			doerFunc(func(cmd string, args ...interface{}) (interface{}, error) {
+				if args[0] == key {
+					if cmd == "HLEN" {
+						return []byte("0"), nil
+					}
+					return nil, fmt.Errorf("flaky")
+				}
+				panic("should not get here")
+			}),
+			"flaky",
+		},
+		{
+			"lost race",
+			doerFunc(func(cmd string, args ...interface{}) (interface{}, error) {
+				if args[0] == key {
+					if cmd == "HLEN" {
+						return []byte("0"), nil
+					}
+					return int64(0), nil
+				}
+				panic("should not get here")
+			}),
+			ErrKeyExists.Error(),
+		},
+
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := reserve(tc.doer, key, []byte(info))
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("expected %q; got %v\n", tc.err, err)
 			}
 		})
 	}

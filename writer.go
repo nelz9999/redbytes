@@ -67,6 +67,9 @@ func Expires(d time.Duration) WriteOption {
 // in the stream. If not set, no PubSub notifications are emitted.
 func PublishChannel(channel string) WriteOption {
 	return func(wo *WriteOptions) error {
+		if channel == "" {
+			return fmt.Errorf("invalid channel: %q", channel)
+		}
 		wo.pubChan = channel
 		return nil
 	}
@@ -76,7 +79,8 @@ func PublishChannel(channel string) WriteOption {
 // PubSub messages. This is probably only needed for Redis Cluster users,
 // when the PublishChannel might get mapped to a different node than the
 // base hash key. If not set, the initial Redis client will be used
-// by default.
+// by default. Setting the PublishClient(...) alone is insufficient, the
+// PublishChannel(...) must also be set to be effective.
 func PublishClient(client Doer) WriteOption {
 	return func(wo *WriteOptions) error {
 		if client == nil {
@@ -131,7 +135,7 @@ func NewRedisByteStreamWriter(ctx context.Context, client Doer, key string, opts
 	}
 
 	// Send it off into the world to do its work
-	return wc, nil
+	return newClosedPipeWriteCloser(wc), nil
 }
 
 func reserve(doer Doer, key string, info []byte) error {

@@ -79,6 +79,12 @@ func (fn fetcherFunc) fetch() redis.Conn {
 	return fn()
 }
 
+type doerFunc func(cmd string, args ...interface{}) (interface{}, error)
+
+func (fn doerFunc) Do(cmd string, args ...interface{}) (interface{}, error) {
+	return fn(cmd, args...)
+}
+
 func TestIntegrationRedis(t *testing.T) {
 	fm := fetchers(t)
 	for name, pool := range fm {
