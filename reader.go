@@ -112,60 +112,36 @@ func NewRedisByteStreamReader(parent context.Context, doer Doer, key string, opt
 		}
 	}
 
-	closers := []func() error{}
-	closeFn := func() error {
+	closers := []io.Closer{}
+	closeAll := closerFunc(func() error {
 		var result error
 		for _, closer := range closers {
-			e := closer()
+			e := closer.Close()
 			if result == nil {
 				result = e
 			}
 		}
 		return result
-	}
+	})
 
-	var subs chan struct{}
+	var subs <-chan struct{}
 	if ro.channel != "" {
-		err = ro.psc.Subscribe(ro.channel)
+		ch, cl, err := newSubscriptionStimulus(ro.psc, ro.channel, key)
 		if err != nil {
 			return nil, nil, err
 		}
-		var wg sync.WaitGroup
-		closers = append(closers, func() error {
-			cerr := ro.psc.Unsubscribe()
-			wg.Wait()
-			return cerr
-		})
-
-		subs = make(chan struct{})
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				switch n := ro.psc.Receive().(type) {
-				case error: // TODO: consider ctx.cxl()?
-					return
-				case redis.Message:
-					if string(n.Data) == key {
-						subs <- struct{}{}
-					}
-				case redis.Subscription:
-					if n.Count == 0 {
-						return
-					}
-				}
-			}
-		}()
+		closers = append(closers, cl)
+		subs = ch
 	}
 
 	var tick <-chan time.Time
 	if ro.poll != 0 {
 		ticker := time.NewTicker(ro.poll)
 		tick = ticker.C
-		closers = append(closers, func() error {
+		closers = append(closers, closerFunc(func() error {
 			ticker.Stop()
 			return nil
-		})
+		}))
 	}
 
 	if subs == nil && tick == nil {
@@ -173,22 +149,62 @@ func NewRedisByteStreamReader(parent context.Context, doer Doer, key string, opt
 	}
 
 	ctx, cxl := context.WithCancel(parent)
-	closers = append(closers, func() error {
+	closers = append(closers, closerFunc(func() error {
 		cxl()
 		return nil
-	})
+	}))
 
 	info, err := fetchInfo(ctx, doer, key, ro.starve, tick, subs)
 	if err != nil {
-		defer closeFn()
+		defer closeAll.Close()
 		return nil, nil, err
 	}
 
 	rr := newStreamFromHashReader(doer, key, ro.ahead)
 	rr = newRetryReader(ctx, rr, ro.starve, tick, subs)
-	rc := closeFuncReadCloser{rr, closeFn}
+	rc := closeFuncReadCloser{rr, closeAll}
 
 	return info, rc, nil
+}
+
+func newSubscriptionStimulus(psc redis.PubSubConn, channel, key string) (<-chan struct{}, io.Closer, error) {
+	err := psc.Subscribe(channel)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var wg sync.WaitGroup
+	closer := closerFunc(func() error {
+		cerr := psc.Unsubscribe()
+		wg.Wait()
+		return cerr
+	})
+
+	subs := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			switch n := psc.Receive().(type) {
+			case error: // TODO: consider ctx.cxl()?
+				return
+			case redis.Message:
+				if string(n.Data) == key {
+					select {
+					case subs <- struct{}{}:
+						// happy path
+					default:
+						// don't block if there's already stimulus on the line
+					}
+				}
+			case redis.Subscription:
+				if n.Count == 0 {
+					return
+				}
+			}
+		}
+	}()
+	return subs, closer, nil
 }
 
 type readerFunc func(p []byte) (n int, err error)
@@ -197,13 +213,15 @@ func (fn readerFunc) Read(p []byte) (int, error) {
 	return fn(p)
 }
 
-type closeFuncReadCloser struct {
-	io.Reader
-	fn func() error
+type closerFunc func() error
+
+func (fn closerFunc) Close() error {
+	return fn()
 }
 
-func (c closeFuncReadCloser) Close() error {
-	return c.fn()
+type closeFuncReadCloser struct {
+	io.Reader
+	io.Closer
 }
 
 func newStreamFromHashReader(doer Doer, key string, ahead int) io.Reader {
@@ -277,25 +295,21 @@ func newStreamFromHashReader(doer Doer, key string, ahead int) io.Reader {
 }
 
 func newRetryReader(ctx context.Context, base io.Reader, starve time.Duration, tick <-chan time.Time, subs <-chan struct{}) io.Reader {
-	first := make(chan struct{}, 1)
-	recent := time.Now()
+	starveAt := time.Now().Add(starve)
 	return readerFunc(func(p []byte) (int, error) {
-		select {
-		case first <- struct{}{}:
-			// happy path
-		default:
-			// no stall if first didn't get drained on a previous iteration
-		}
+		first := make(chan struct{})
+		close(first)
 		for {
-			starveTTL := recent.Add(starve).Sub(time.Now())
+			// starveTTL := recent.Add(starve).Sub(time.Now())
 			select {
 			case <-ctx.Done():
 				return 0, ctx.Err()
-			case <-time.After(starveTTL):
+			case <-time.After(time.Until(starveAt)):
 				return 0, io.ErrUnexpectedEOF
 			case <-first:
 				// we automatically want to try the underlying Reader
 				// on our first time through
+				first = nil // block forevermore
 			case <-tick:
 				// We received polling stimulus to try the read again
 			case <-subs:
@@ -309,7 +323,7 @@ func newRetryReader(ctx context.Context, base io.Reader, starve time.Duration, t
 				// We do not check for err == nil, because the io.Reader
 				// documentation states: "Callers should always process the
 				// n > 0 bytes returned before considering the error err."
-				recent = time.Now()
+				starveAt = time.Now().Add(starve)
 			}
 			if err != errIncomplete {
 				// We only want to loop/retry when we've gotten
@@ -323,14 +337,12 @@ func newRetryReader(ctx context.Context, base io.Reader, starve time.Duration, t
 func fetchInfo(ctx context.Context, doer Doer, key string, starve time.Duration, tick <-chan time.Time, subs <-chan struct{}) ([]byte, error) {
 	first := make(chan struct{})
 	close(first)
-	recent := time.Now()
-
+	starveAt := time.Now().Add(starve)
 	for {
-		starveTTL := recent.Add(starve).Sub(time.Now())
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(starveTTL):
+		case <-time.After(time.Until(starveAt)):
 			return nil, io.ErrUnexpectedEOF
 		case <-first:
 			// we automatically want to try the underlying Reader
