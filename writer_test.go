@@ -136,3 +136,59 @@ func TestIntegrationWriterDirect(t *testing.T) {
 		})
 	}
 }
+
+func TestIntegrationWriteReserveErrors(t *testing.T) {
+	testCases := []struct {
+		name  string
+		setup func(conn redis.Conn, name string) error
+	}{
+		{
+			"different datastructure",
+			func(conn redis.Conn, name string) error {
+				_, err := conn.Do("LPUSH", name, "")
+				return err
+			},
+		},
+		{
+			"non-redbytes hash",
+			func(conn redis.Conn, name string) error {
+				_, err := conn.Do("HSET", name, "bubba", "gump")
+				return err
+			},
+		},
+		{
+			"lost lock race",
+			func(conn redis.Conn, name string) error {
+				_, err := conn.Do("HSET", name, metadata, "gump")
+				return err
+			},
+		},
+	}
+
+	base := randomString()
+	for client, fetcher := range fetchers(t) {
+		t.Run(client, func(t *testing.T) {
+			for ix, tc := range testCases {
+				t.Run(tc.name, func(t *testing.T) {
+					name := fmt.Sprintf("%d-%s-%s", ix, client, base)
+
+					conn := fetcher.fetch()
+					defer conn.Close()
+					defer func() {
+						conn.Do("DELETE", name)
+					}()
+
+					err := tc.setup(conn, name)
+					if err != nil {
+						t.Errorf("unexpected: %v\n", err)
+					}
+
+					err = reserve(conn, name, nil)
+					if err == nil {
+						t.Errorf("expected an error on NewRedisByteStreamReader")
+					}
+				})
+			}
+		})
+	}
+}
