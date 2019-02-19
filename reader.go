@@ -186,7 +186,7 @@ func newSubscriptionStimulus(psc redis.PubSubConn, channel, key string) (<-chan 
 		defer wg.Done()
 		for {
 			switch n := psc.Receive().(type) {
-			case error: // TODO: consider ctx.cxl()?
+			case error:
 				return
 			case redis.Message:
 				if string(n.Data) == key {

@@ -19,6 +19,13 @@ func chunkReader(r io.Reader, max int) io.Reader {
 	})
 }
 
+func delayReader(r io.Reader, d time.Duration) io.Reader {
+	return readerFunc(func(p []byte) (int, error) {
+		time.Sleep(d)
+		return r.Read(p)
+	})
+}
+
 func TestIntegrationReaderDirect(t *testing.T) {
 	testCases := []struct {
 		name string

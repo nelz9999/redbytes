@@ -1,6 +1,9 @@
 package redbytes
 
 import (
+	"context"
+	"crypto/md5"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io"
@@ -96,8 +99,148 @@ func TestIntegrationRedis(t *testing.T) {
 			continue
 		}
 		t.Logf("%s: \n%s\n", name, resp)
+	}
+}
 
-		resp, err = redis.Bytes(conn.Do("PING", time.Now().UnixNano()))
-		t.Logf("PING: %v / %s", err, resp)
+func TestIntegrationRoundtripSuccess(t *testing.T) {
+	base := randomString()
+	channel := fmt.Sprintf("my-pubsub-channel-name-%s", base)
+	testCases := []struct {
+		name  string
+		wopts func() []WriteOption
+		ropts func(c redis.Conn) []ReadOption
+	}{
+		{
+			"no pubsub",
+			func() []WriteOption {
+				return nil
+			},
+			func(c redis.Conn) []ReadOption {
+				return []ReadOption{
+					PollInterval(75 * time.Millisecond),
+					Lookahead(5),
+					StarveInterval(500 * time.Millisecond),
+				}
+			},
+		},
+		{
+			"ya pubsub",
+			func() []WriteOption {
+				return []WriteOption{PublishChannel(channel)}
+			},
+			func(c redis.Conn) []ReadOption {
+				return []ReadOption{
+					Subscribe(c, channel),
+					Lookahead(5),
+					StarveInterval(500 * time.Millisecond),
+				}
+			},
+		},
+	}
+
+	for client, fetcher := range fetchers(t) {
+		t.Run(client, func(t *testing.T) {
+			for ix, tc := range testCases {
+				t.Run(tc.name, func(t *testing.T) {
+					name := fmt.Sprintf("%d-%s-%s", ix, client, base)
+					meta := fmt.Sprintf("%s-%s", name, randomString())
+					ctx, cxl := context.WithCancel(context.Background())
+					defer cxl()
+
+					size := (3 + (time.Now().UnixNano() % 7)) * 1024 // 3-9 kb
+					// t.Logf("size: %d\n", size)
+
+					// Read-side
+					rCh := make(chan string)
+					go func() {
+						defer close(rCh)
+
+						rx := fetcher.fetch()
+						defer rx.Close()
+
+						sub := fetcher.fetch()
+						defer sub.Close()
+
+						md, rc, err := NewRedisByteStreamReader(ctx, rx, name, tc.ropts(sub)...)
+						if err != nil {
+							t.Errorf("reader standup: %v\n", err)
+							return
+						}
+						defer rc.Close()
+						if string(md) != meta {
+							t.Errorf("expected %q; got %q\n", meta, md)
+						}
+
+						sum := md5.New()
+						n, err := io.Copy(sum, rc)
+						if err != nil {
+							t.Errorf("reader copy: %v\n", err)
+							return
+						}
+
+						if n != size {
+							t.Errorf("expected size %d; got %d\n", size, n)
+						}
+
+						rCh <- fmt.Sprintf("%x", sum.Sum(nil))
+					}()
+
+					// Write side
+					wCh := make(chan string)
+					go func() {
+						defer close(wCh)
+
+						tx := fetcher.fetch()
+						defer tx.Close()
+
+						wc, err := NewRedisByteStreamWriter(ctx, tx, name, append(tc.wopts(), Expires(time.Minute), Metadata([]byte(meta)))...)
+						if err != nil {
+							t.Errorf("writer standup: %v\n", err)
+							return
+						}
+						defer wc.Close()
+
+						src := rand.Reader
+						src = io.LimitReader(src, size)             // 7kb as a good test?
+						src = chunkReader(src, 150)                 // 100 bytes at a time
+						src = delayReader(src, 50*time.Millisecond) // 50ms per chunk
+
+						sum := md5.New()
+
+						n, err := io.Copy(io.MultiWriter(wc, sum), src)
+						if err != nil {
+							t.Errorf("writer copy: %v\n", err)
+							return
+						}
+
+						if n != size {
+							t.Errorf("expected size %d; got %d\n", size, n)
+						}
+
+						wCh <- fmt.Sprintf("%x", sum.Sum(nil))
+					}()
+
+					rSum, wSum := "", ""
+					select {
+					case s := <-wCh:
+						wSum = s
+					case <-time.After(10 * time.Second):
+						t.Errorf("write-side timeout")
+					}
+
+					select {
+					case s := <-rCh:
+						rSum = s
+					case <-time.After(10 * time.Second):
+						t.Errorf("read-side timeout")
+					}
+
+					if wSum != rSum {
+						t.Errorf("mismatch checksums: %q != %q\n", wSum, rSum)
+					}
+					// t.Logf("checks: %q\n", wSum)
+				})
+			}
+		})
 	}
 }
