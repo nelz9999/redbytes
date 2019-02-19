@@ -16,35 +16,43 @@ import (
 func TestIntegrationWriterDirect(t *testing.T) {
 	testCases := []struct {
 		name  string
-		src   io.Reader
+		src   func() io.Reader
 		max   int
 		parts []string
 		pubX  int
 	}{
 		{
 			"remainder",
-			bytes.NewBufferString(alphabet),
+			func() io.Reader {
+				return bytes.NewBufferString(alphabet)
+			},
 			10,
 			[]string{"abcdefghij", "klmnopqrst", "uvwxyz"},
 			2, // 3 chunk in one go, plus close
 		},
 		{
 			"exact multiple",
-			bytes.NewBuffer([]byte(alphabet)[1:]),
+			func() io.Reader {
+				return bytes.NewBuffer([]byte(alphabet)[1:])
+			},
 			5,
 			[]string{"bcdef", "ghijk", "lmnop", "qrstu", "vwxyz"},
 			2, // 5 chunk in one go, plus close
 		},
 		{
 			"zero length",
-			bytes.NewBufferString(""),
+			func() io.Reader {
+				return bytes.NewBufferString("")
+			},
 			DefaultMaxChunkSize,
 			nil,
 			1, // just close
 		},
 		{
 			"single bytes",
-			chunkReader(bytes.NewBufferString(alphabet), 1),
+			func() io.Reader {
+				return chunkReader(bytes.NewBufferString(alphabet), 1)
+			},
 			DefaultMaxChunkSize,
 			[]string{
 				"a", "b", "c", "d", "e", "f", "g", "h",
@@ -92,13 +100,14 @@ func TestIntegrationWriterDirect(t *testing.T) {
 						PublishClient(pub),
 					)
 					if err != nil {
-						t.Fatalf("unexpected: %v\n", err)
+						t.Fatalf("unexpected startup: %v\n", err)
 					}
 
-					_, err = io.Copy(wc, tc.src)
+					_, err = io.Copy(wc, tc.src())
 					if err != nil {
 						t.Fatalf("unexpected copy error: %v\n", err)
 					}
+
 					err = wc.Close()
 					if err != nil {
 						t.Fatalf("unexpected close error: %v\n", err)
@@ -114,23 +123,20 @@ func TestIntegrationWriterDirect(t *testing.T) {
 						expectations[field] = part
 					}
 
-					hasErr := false
 					var val string
 					for field, should := range expectations {
 						val, err = redis.String(conn.Do("HGET", name, field))
 						if err != nil {
-							hasErr = true
-							t.Errorf("unexpected: %v\n", err)
+							t.Errorf("unexpected: %q %v\n", field, err)
 						}
 						if val != should {
-							hasErr = true
 							t.Errorf("%q; expected %q; got %q\n", field, should, val)
 						}
 					}
-					if hasErr {
+					if t.Failed() {
 						contents, cerr := redis.StringMap(conn.Do("HGETALL", name))
 						if cerr != nil {
-							t.Fatalf("unexpected: %v\n", cerr)
+							t.Fatalf("unexpected reporting failure: %v\n", cerr)
 						}
 						t.Logf("full contents of %q:\n", name)
 						for k, v := range contents {

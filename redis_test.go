@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
+	"github.com/mna/redisc"
 )
 
 func TestMain(m *testing.M) {
@@ -60,10 +61,41 @@ func fetchers(t *testing.T) map[string]fetcher {
 					return nil
 				},
 			}
+			_ = pool
 			cm["redigo"] = pool
 			fm["redigo"] = fetcherFunc(func() redis.Conn {
 				return pool.Get()
 			})
+		}
+		multi := os.Getenv(envRedisCluster)
+		if multi != "" {
+			t.Logf("env %q = %q\n", envRedisCluster, multi)
+			cluster := &redisc.Cluster{
+				StartupNodes: []string{multi},
+				DialOptions:  []redis.DialOption{redis.DialConnectTimeout(2 * time.Second)},
+				CreatePool: func(addr string, opts ...redis.DialOption) (*redis.Pool, error) {
+					return &redis.Pool{
+						MaxIdle:     3,
+						IdleTimeout: 10 * time.Second,
+						Dial: func() (redis.Conn, error) {
+							return redis.Dial("tcp", addr, opts...)
+						},
+						TestOnBorrow: func(c redis.Conn, _ time.Time) error {
+							_, err := c.Do("PING")
+							return err
+						},
+					}, nil
+				},
+			}
+			err := cluster.Refresh()
+			if err != nil {
+				t.Errorf("redisc: %v\n", err)
+			} else {
+				cm["redisc"] = cluster
+				fm["redisc"] = fetcherFunc(func() redis.Conn {
+					return cluster.Get()
+				})
+			}
 		}
 	})
 	if len(fm) < 1 {
